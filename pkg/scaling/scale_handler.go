@@ -62,6 +62,8 @@ type ScaleHandler struct {
 	// listElastiServices returns the ElastiServices each scale-down cycle
 	// evaluates; a fresh API LIST unless SetElastiServiceLister replaced it.
 	listElastiServices ElastiServiceLister
+	// scanner evaluates them and dispatches the resulting scale actions.
+	scanner *scanner
 }
 
 // ElastiServiceLister returns the ElastiServices the scale-down loop
@@ -113,6 +115,7 @@ func NewScaleHandler(logger *zap.Logger, config *rest.Config, watchNamespaces []
 		EventRecorder:   eventRecorder,
 	}
 	h.listElastiServices = h.listElastiServicesFromAPI
+	h.scanner = newScanner(scanConfigFromEnv(h.logger))
 	return h
 }
 
@@ -184,38 +187,41 @@ func (h *ScaleHandler) listElastiServicesFromAPI(ctx context.Context) ([]v1alpha
 func (h *ScaleHandler) checkAndScale(ctx context.Context) error {
 	services, listErr := h.listElastiServices(ctx)
 	health := newHealthMemo()
-	for i := range services {
-		es := &services[i]
-		cooldownPeriod := resolveCooldownPeriod(es)
-
-		scaleDirection, err := h.calculateScaleDirection(ctx, cooldownPeriod, es, health)
+	evaluate := func(ctx context.Context, es *v1alpha1.ElastiService) (ScaleDirection, error) {
+		direction, err := h.calculateScaleDirection(ctx, resolveCooldownPeriod(es), es, health)
 		if err != nil {
 			h.logger.Error("failed to calculate scale direction", zap.String("service", es.Spec.Service), zap.String("namespace", es.Namespace), zap.Error(err))
-			continue
-		} else if scaleDirection == NoScale {
-			continue
 		}
-
-		switch scaleDirection {
-		case ScaleDown:
-			err := h.handleScaleToZero(ctx, es)
-			if err != nil {
-				h.logger.Error("failed to scale target to zero", zap.String("service", es.Spec.Service), zap.String("namespace", es.Namespace), zap.Error(err))
-				continue
-			}
-		case ScaleUp:
-			err := h.handleScaleFromZero(ctx, es)
-			if err != nil {
-				h.logger.Error("failed to scale target from zero", zap.String("service", es.Spec.Service), zap.String("namespace", es.Namespace), zap.Error(err))
-				continue
-			}
-		}
+		return direction, err
 	}
+	h.scanner.run(ctx, services, evaluate, h.applyScaleDirection)
 
 	if listErr != nil {
 		return fmt.Errorf("failed to list ElastiServices: %w", listErr)
 	}
 	return nil
+}
+
+// applyScaleDirection carries out a scan's decision for es.
+func (h *ScaleHandler) applyScaleDirection(ctx context.Context, es *v1alpha1.ElastiService, direction ScaleDirection) error {
+	switch direction {
+	case ScaleDown:
+		if err := h.handleScaleToZero(ctx, es); err != nil {
+			h.logger.Error("failed to scale target to zero", zap.String("service", es.Spec.Service), zap.String("namespace", es.Namespace), zap.Error(err))
+			return err
+		}
+	case ScaleUp:
+		if err := h.handleScaleFromZero(ctx, es); err != nil {
+			h.logger.Error("failed to scale target from zero", zap.String("service", es.Spec.Service), zap.String("namespace", es.Namespace), zap.Error(err))
+			return err
+		}
+	}
+	return nil
+}
+
+// SetScanObserver receives the scale-down scan's measurements.
+func (h *ScaleHandler) SetScanObserver(observer ScanObserver) {
+	h.scanner.observer = observer
 }
 
 func (h *ScaleHandler) calculateScaleDirection(ctx context.Context, cooldownPeriod time.Duration, es *v1alpha1.ElastiService, health *healthMemo) (ScaleDirection, error) {

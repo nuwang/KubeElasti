@@ -33,6 +33,7 @@ import (
 
 	"truefoundry/elasti/operator/internal/crddirectory"
 	"truefoundry/elasti/operator/internal/informer"
+	"truefoundry/elasti/operator/internal/prom"
 
 	tfLogger "github.com/truefoundry/elasti/pkg/logger"
 
@@ -187,6 +188,7 @@ func mainWithError() error {
 	// Each scale-down cycle reads ElastiServices from the manager's cache
 	// (scoped to the watched namespaces) instead of listing the API server.
 	scaleHandler.SetElastiServiceLister(controller.CachedElastiServiceLister(mgr.GetCache()))
+	scaleHandler.SetScanObserver(prom.ScanObserver{})
 
 	// Set up the ElastiService controller
 	reconciler := &controller.ElastiServiceReconciler{

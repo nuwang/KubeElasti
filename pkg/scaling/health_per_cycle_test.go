@@ -66,6 +66,7 @@ func idleES(t *testing.T, name, serverURL string, cooldownSeconds int32) v1alpha
 	es.Name = name
 	es.CreationTimestamp = metav1.NewTime(time.Now().Add(-24 * time.Hour))
 	es.Spec.Service = name
+	es.Spec.ScaleTargetRef = v1alpha1.ScaleTargetRef{APIVersion: "apps/v1", Kind: "Deployment", Name: name}
 	es.Spec.CooldownPeriod = cooldownSeconds
 	es.Spec.Triggers = []v1alpha1.ScaleTrigger{{Type: "prometheus", Metadata: metadata}}
 	now := metav1.Now()
@@ -74,7 +75,7 @@ func idleES(t *testing.T, name, serverURL string, cooldownSeconds int32) v1alpha
 }
 
 func handlerListing(services ...v1alpha1.ElastiService) *ScaleHandler {
-	h := &ScaleHandler{logger: zap.NewNop()}
+	h := &ScaleHandler{logger: zap.NewNop(), scanner: newScanner(scanConfig{})}
 	h.SetElastiServiceLister(func(context.Context) ([]v1alpha1.ElastiService, error) {
 		return services, nil
 	})
@@ -94,6 +95,7 @@ func TestCheckAndScaleChecksScalerHealthOncePerCycle(t *testing.T) {
 		if err := h.checkAndScale(context.Background()); err != nil {
 			t.Fatalf("cycle %d: checkAndScale: %v", cycle, err)
 		}
+		h.scanner.waitForActions() // targets with an action in flight are skipped
 		if got := prom.healthQueries.Load(); got != int32(cycle) {
 			t.Fatalf("after cycle %d: %d health queries, want %d (one per cycle)", cycle, got, cycle)
 		}
@@ -153,5 +155,42 @@ func TestHealthMemoChecksUnkeyedScalerEveryTime(t *testing.T) {
 	}
 	if s.healthChecks != 3 {
 		t.Fatalf("%d health checks, want 3 (no key, nothing to share)", s.healthChecks)
+	}
+}
+
+// The scan evaluates ElastiServices concurrently end to end: real trigger
+// queries against Prometheus overlap, up to the configured concurrency.
+func TestCheckAndScaleQueriesPrometheusConcurrently(t *testing.T) {
+	var queries peakTracker
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		value := "1" // healthy
+		if !strings.HasPrefix(r.URL.Query().Get("query"), "min_over_time((max(up{") {
+			queries.enter()
+			defer queries.leave()
+			time.Sleep(40 * time.Millisecond)
+			value = "0" // idle
+		}
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"value":[1,"` + value + `"]}]}}`))
+	}))
+	t.Cleanup(srv.Close)
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatalf("parse stub URL: %v", err)
+	}
+	t.Setenv("PROMETHEUS_TRIGGER_ALLOWED_SERVER_ADDRESSES", u.Host)
+	var services []v1alpha1.ElastiService
+	for _, name := range []string{"a", "b", "c", "d", "e", "f", "g", "h"} {
+		services = append(services, idleES(t, name, srv.URL, 300))
+	}
+	h := handlerListing(services...)
+	h.scanner = newScanner(scanConfig{concurrency: 4})
+
+	if err := h.checkAndScale(context.Background()); err != nil {
+		t.Fatalf("checkAndScale: %v", err)
+	}
+	h.scanner.waitForActions()
+
+	if got := queries.peak.Load(); got != 4 {
+		t.Fatalf("peak concurrent trigger queries = %d, want 4", got)
 	}
 }

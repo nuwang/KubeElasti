@@ -18,7 +18,7 @@ import (
 
 func handlerWithLister(lister ElastiServiceLister) (*ScaleHandler, *observer.ObservedLogs) {
 	core, logs := observer.New(zapcore.InfoLevel)
-	h := &ScaleHandler{logger: zap.New(core)}
+	h := &ScaleHandler{logger: zap.New(core), scanner: newScanner(scanConfig{})}
 	h.SetElastiServiceLister(lister)
 	return h, logs
 }
@@ -72,5 +72,23 @@ func TestCheckAndScaleEvaluatesListedServicesDespiteListError(t *testing.T) {
 	}
 	if !evaluated(logs, "team-a", "app") {
 		t.Fatal("services listed before the error were not evaluated")
+	}
+}
+
+func TestCheckAndScaleReportsCycleToScanObserver(t *testing.T) {
+	h, _ := handlerWithLister(func(context.Context) ([]v1alpha1.ElastiService, error) {
+		return []v1alpha1.ElastiService{untriggeredES("team-a", "app")}, nil
+	})
+	obs := newRecordingObserver()
+	h.SetScanObserver(obs)
+
+	if err := h.checkAndScale(context.Background()); err != nil {
+		t.Fatalf("checkAndScale: %v", err)
+	}
+
+	obs.mu.Lock()
+	defer obs.mu.Unlock()
+	if len(obs.cycles) != 1 || obs.cycles[0] != 1 || obs.evaluations[string(EvaluationError)] != 1 {
+		t.Fatalf("observer saw cycles=%v evaluations=%v, want one cycle with one (errored) evaluation", obs.cycles, obs.evaluations)
 	}
 }
