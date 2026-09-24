@@ -183,11 +183,12 @@ func (h *ScaleHandler) listElastiServicesFromAPI(ctx context.Context) ([]v1alpha
 
 func (h *ScaleHandler) checkAndScale(ctx context.Context) error {
 	services, listErr := h.listElastiServices(ctx)
+	health := newHealthMemo()
 	for i := range services {
 		es := &services[i]
 		cooldownPeriod := resolveCooldownPeriod(es)
 
-		scaleDirection, err := h.calculateScaleDirection(ctx, cooldownPeriod, es)
+		scaleDirection, err := h.calculateScaleDirection(ctx, cooldownPeriod, es, health)
 		if err != nil {
 			h.logger.Error("failed to calculate scale direction", zap.String("service", es.Spec.Service), zap.String("namespace", es.Namespace), zap.Error(err))
 			continue
@@ -217,7 +218,7 @@ func (h *ScaleHandler) checkAndScale(ctx context.Context) error {
 	return nil
 }
 
-func (h *ScaleHandler) calculateScaleDirection(ctx context.Context, cooldownPeriod time.Duration, es *v1alpha1.ElastiService) (ScaleDirection, error) {
+func (h *ScaleHandler) calculateScaleDirection(ctx context.Context, cooldownPeriod time.Duration, es *v1alpha1.ElastiService, health *healthMemo) (ScaleDirection, error) {
 	if len(es.Spec.Triggers) == 0 {
 		h.logger.Info("No triggers found, skipping scale to zero", zap.String("namespace", es.Namespace), zap.String("service", es.Spec.Service))
 		return "", fmt.Errorf("no triggers found")
@@ -255,8 +256,7 @@ func (h *ScaleHandler) calculateScaleDirection(ctx context.Context, cooldownPeri
 		}
 		defer scaler.Close(ctx)
 
-		// TODO: Cache the health of the scaler if the server address has already been checked
-		healthy, err := scaler.IsHealthy(ctx)
+		healthy, err := health.isHealthy(ctx, scaler)
 		if err != nil {
 			h.logger.Warn(
 				"failed to check scaler health",
