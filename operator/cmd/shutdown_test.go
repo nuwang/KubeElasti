@@ -126,7 +126,9 @@ func startOperator(t *testing.T, kubeconfig string, args ...string) *operatorPro
 	}
 	go func() { p.exited <- cmd.Wait() }()
 	t.Cleanup(func() {
-		_ = cmd.Process.Kill()
+		if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			t.Errorf("kill operator: %v", err)
+		}
 		if t.Failed() {
 			t.Logf("operator output:\n%s", p.output.String())
 		}
